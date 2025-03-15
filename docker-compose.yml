@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  pg-source:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: source_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-source-data:/var/lib/postgresql/data
+      - ./init/source:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pg-dest:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dest_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-dest-data:/var/lib/postgresql/data
+      - ./init/dest:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg-source-data:
+  pg-dest-data:
