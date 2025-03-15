@@ -288,9 +288,11 @@ async fn send_copy_header(mut sink: Pin<&mut CopyInSink<Bytes>>) -> Result<(), A
 }
 
 async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, AppError> {
+    log::debug!("Starting attempt_copy for batch {}-{}", start, end);
     let mut src_client = config.src_pool.get().await?;
     let mut dest_client = config.dest_pool.get().await?;
 
+    log::debug!("Creating COPY SQL for dest table {}", config.dest_table);
     let copy_sql = format!(
         "COPY {} ({}) FROM STDIN BINARY",
         config.dest_table,
@@ -309,31 +311,53 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     let start_i32: i32 = start.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", start)))?;
     let end_i32: i32 = end.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", end)))?;
     
+    let query = format!(
+        "DECLARE {} NO SCROLL CURSOR FOR SELECT * FROM {} WHERE id BETWEEN $1 AND $2",
+        cursor_name, config.source_table
+    );
+    log::debug!("Executing query: {} with params [{}, {}]", query, start_i32, end_i32);
+    
     src_txn
-        .execute(
-            &format!(
-                "DECLARE {} NO SCROLL CURSOR FOR SELECT * FROM {} WHERE id BETWEEN $1 AND $2",
-                cursor_name, config.source_table
-            ),
-            &[&start_i32, &end_i32],
-        )
+        .execute(&query, &[&start_i32, &end_i32])
         .await?;
+        
+    log::debug!("Cursor declared, fetching rows");
 
+    let fetch_query = format!("FETCH ALL FROM {}", cursor_name);
+    log::debug!("Executing fetch query: {}", fetch_query);
     let rows = src_txn
-        .query(&format!("FETCH ALL FROM {}", cursor_name), &[])
+        .query(&fetch_query, &[])
         .await?;
 
+    log::debug!("Fetched {} rows from source", rows.len());
+    if rows.is_empty() {
+        log::warn!("No rows found for batch {}-{}", start, end);
+        return Ok(0);
+    }
+    
+    // Debug: print the first row to verify structure
+    if !rows.is_empty() {
+        let first_row = &rows[0];
+        log::debug!("First row columns: {}", first_row.columns().len());
+        for (i, col) in first_row.columns().iter().enumerate() {
+            log::debug!("Column {}: {}:{}", i, col.name(), col.type_().name());
+        }
+    }
+
+    log::debug!("Starting destination transaction");
     let dest_txn = dest_client.transaction().await?;
+    log::debug!("Initiating COPY operation: {}", copy_sql);
     let sink = dest_txn.copy_in(&copy_sql).await?;
     
     // Pin the sink
     futures::pin_mut!(sink);
     
-    // Send binary COPY format header first
+    log::debug!("Sending COPY header");
     send_copy_header(sink.as_mut()).await?;
 
     // Process in small chunks to avoid memory issues
     let chunk_size = 100;
+    log::debug!("Processing {} rows in chunks of {}", rows.len(), chunk_size);
     
     for chunk in rows.chunks(chunk_size) {
         write_copy_data(sink.as_mut(), chunk, &config.dest_columns).await?;
@@ -342,8 +366,11 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     // Finalize
     sink.send(Bytes::from_static(COPY_TRAILER)).await?;
     
+    log::debug!("Committing transactions");
     dest_txn.commit().await.map_err(AppError::Database)?;
     src_txn.commit().await.map_err(AppError::Database)?;
+    
+    log::debug!("Successfully copied {} rows", rows.len());
     Ok(rows.len() as u64)
 }
 
