@@ -153,31 +153,71 @@ async fn write_copy_data(
         buf.put_i16(columns.len() as i16);
         
         for (i, col) in columns.iter().enumerate() {
-            // Handle each field
-            match row.try_get::<_, Option<&[u8]>>(i) {
-                Ok(Some(bytes)) => {
-                    // Field length
-                    buf.put_i32(bytes.len() as i32);
-                    
-                    match Type::from_oid(col.type_oid) {
-                        Some(Type::JSONB) => {
-                            // JSONB has a version byte
-                            buf.put_u8(1);
-                            buf.put_slice(bytes);
-                        },
-                        Some(Type::INT4) if bytes.len() == 4 => {
-                            let num = i32::from_be_bytes(bytes[..4].try_into()?);
-                            buf.put_slice(&num.to_be_bytes());
-                        },
-                        Some(_) => {
-                            buf.put_slice(bytes);
-                        },
-                        None => return Err(AppError::InvalidDataType(col.type_oid)),
+            // Try to get the column by name first for more reliable access
+            let col_name = &col.name;
+            let col_type = Type::from_oid(col.type_oid).ok_or_else(|| AppError::InvalidDataType(col.type_oid))?;
+            
+            // Handle each field type appropriately - check for NULL values by trying to get them first
+            
+            match col_type {
+                Type::INT4 => {
+                    if let Ok(value) = row.try_get::<_, i32>(i) {
+                        buf.put_i32(4); // Length
+                        buf.put_i32(value);
+                    } else {
+                        // If we can't get the value as expected type, use NULL
+                        buf.put_i32(-1);
                     }
                 },
+                Type::TEXT | Type::VARCHAR => {
+                    if let Ok(value) = row.try_get::<_, String>(i) {
+                        let bytes = value.as_bytes();
+                        buf.put_i32(bytes.len() as i32);
+                        buf.put_slice(bytes);
+                    } else {
+                        buf.put_i32(-1);
+                    }
+                },
+                Type::BOOL => {
+                    if let Ok(value) = row.try_get::<_, bool>(i) {
+                        buf.put_i32(1); // Length
+                        buf.put_u8(if value { 1 } else { 0 });
+                    } else {
+                        buf.put_i32(-1);
+                    }
+                },
+                Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+                    // Get as string and encode as bytes
+                    if let Ok(value) = row.try_get::<_, String>(i) {
+                        let bytes = value.as_bytes();
+                        buf.put_i32(bytes.len() as i32);
+                        buf.put_slice(bytes);
+                    } else {
+                        buf.put_i32(-1);
+                    }
+                },
+                Type::JSONB => {
+                    if let Ok(value) = row.try_get::<_, serde_json::Value>(i) {
+                        let json_string = serde_json::to_string(&value).unwrap_or_default();
+                        let bytes = json_string.as_bytes();
+                        buf.put_i32(bytes.len() as i32 + 1); // +1 for version byte
+                        buf.put_u8(1); // JSONB version
+                        buf.put_slice(bytes);
+                    } else {
+                        buf.put_i32(-1);
+                    }
+                },
+                // Add other types as needed
                 _ => {
-                    // Null field
-                    buf.put_i32(-1);
+                    // For unknown types, try to get as string
+                    if let Ok(value) = row.try_get::<_, String>(i) {
+                        let bytes = value.as_bytes();
+                        buf.put_i32(bytes.len() as i32);
+                        buf.put_slice(bytes);
+                    } else {
+                        log::warn!("Unsupported type for column {}: {:?}", col_name, col_type);
+                        buf.put_i32(-1);
+                    }
                 }
             }
         }
