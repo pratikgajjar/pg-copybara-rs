@@ -62,6 +62,10 @@ struct Cli {
     dest_conn: Option<String>,
 }
 
+// PostgreSQL binary COPY protocol constants
+const PGCOPY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+const PGCOPY_FLAGS: &[u8] = &[0, 0, 0, 0];
+const PGCOPY_HEADER_EXT_SIZE: &[u8] = &[0, 0, 0, 0]; // Extension area size in bytes
 const COPY_TRAILER: &[u8] = &[0xff, 0xff];
 
 #[derive(Debug, Error)]
@@ -228,6 +232,21 @@ async fn copy_batch(
     }
 }
 
+async fn send_copy_header(mut sink: Pin<&mut CopyInSink<Bytes>>) -> Result<(), AppError> {
+    // Create a buffer for the header
+    let mut header = BytesMut::with_capacity(19); // Size of signature (11) + flags (4) + extension area size (4)
+    
+    // Add signature, flags, and header extension size
+    header.put_slice(PGCOPY_SIGNATURE);
+    header.put_slice(PGCOPY_FLAGS);
+    header.put_slice(PGCOPY_HEADER_EXT_SIZE);
+    
+    // Send the header
+    sink.send(header.freeze()).await?
+;    
+    Ok(())
+}
+
 async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, AppError> {
     let mut src_client = config.src_pool.get().await?;
     let mut dest_client = config.dest_pool.get().await?;
@@ -269,6 +288,9 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     
     // Pin the sink
     futures::pin_mut!(sink);
+    
+    // Send binary COPY format header first
+    send_copy_header(sink.as_mut()).await?;
 
     // Process in small chunks to avoid memory issues
     let chunk_size = 100;
