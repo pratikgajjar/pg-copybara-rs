@@ -1,10 +1,7 @@
 use std::{
-    collections::VecDeque,
+    array::TryFromSliceError,
     convert::TryInto,
-    env,
-    error::Error,
-    fmt,
-    io::{self, Read, Write},
+    io,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -13,21 +10,21 @@ use std::{
 };
 
 use async_recursion::async_recursion;
-use bytes::{BufMut, Bytes, BytesMut};
-use deadpool_postgres::{Config, Pool, Runtime};
-use futures::{stream::TryStreamExt, StreamExt};
-use postgres_types::{Json, Type};
-use serde_json::Value;
+use bytes::{BufMut, BytesMut, Bytes};
+use deadpool_postgres::{Config, CreatePoolError, Pool, PoolError, Runtime};
+use futures::SinkExt;
+use log;
+use postgres_types::Type;
 use tokio::{
     signal,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch},
     time,
 };
-use tokio_postgres::{binary_copy::BinaryCopyInWriter, Client, NoTls, RowStream, Statement};
+use tokio_postgres::{Client, CopyInSink, Error as TokioPostgresError, NoTls, Row};
+use std::pin::Pin;
 
-use std::{sync::Arc, time::Instant};
 use clap::Parser;
-use tokio::signal;
+use thiserror::Error;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -57,41 +54,43 @@ struct Cli {
     concurrency: usize,
 
     /// Source database connection string
-    #[arg(long, env = "SOURCE_DATABASE_URL")]
+    #[arg(long)]
     source_conn: String,
 
     /// Destination database connection string (defaults to source)
-    #[arg(long, env = "DEST_DATABASE_URL")]
+    #[arg(long)]
     dest_conn: Option<String>,
 }
 
-const COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0";
 const COPY_TRAILER: &[u8] = &[0xff, 0xff];
 
-#[derive(Debug)]
-struct AppError {
-    message: String,
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("Database error: {0}")]
+    Database(#[from] TokioPostgresError),
+    #[error("Connection error: {0}")]
+    Connection(#[from] PoolError),
+    #[error("Pool creation error: {0}")]
+    PoolCreation(String),
+    #[error("Invalid data type with OID {0}")]
+    InvalidDataType(u32),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Array conversion error: {0}")]
+    ArrayConversion(#[from] TryFromSliceError),
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+impl From<CreatePoolError> for AppError {
+    fn from(err: CreatePoolError) -> Self {
+        AppError::PoolCreation(err.to_string())
     }
 }
 
-impl Error for AppError {}
-
-impl From<String> for AppError {
-    fn from(s: String) -> Self {
-        AppError { message: s }
-    }
-}
-
-impl From<&str> for AppError {
-    fn from(s: &str) -> Self {
-        AppError {
-            message: s.to_string(),
-        }
+impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
+    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        AppError::Other(err.to_string())
     }
 }
 
@@ -110,46 +109,78 @@ struct ColumnInfo {
     type_oid: u32,
 }
 
-async fn create_pool(conn_str: &str, max_size: usize) -> Result<Pool, Box<dyn Error>> {
+async fn create_pool(conn_str: &str, max_size: usize) -> Result<Pool, AppError> {
     let mut cfg = Config::new();
     cfg.url = Some(conn_str.to_string());
-    cfg.pool = deadpool_postgres::PoolConfig::new(max_size);
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(max_size));
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
     Ok(pool)
 }
 
-async fn get_table_columns(client: &Client, table: &str) -> Result<Vec<ColumnInfo>, Box<dyn Error>> {
-    let rows = client
-        .query(
-            &format!("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1"),
-            &[&table],
-        )
-        .await?;
-
-    let mut columns = Vec::new();
-    for row in rows {
-        let name: String = row.get(0);
-        let data_type: String = row.get(1);
-        let type_oid = match data_type.as_str() {
-            "integer" => Type::INT4.oid(),
-            "bigint" => Type::INT8.oid(),
-            "jsonb" => Type::JSONB.oid(),
-            "text" => Type::TEXT.oid(),
-            _ => return Err(format!("Unsupported data type: {}", data_type).into()),
-        };
-        columns.push(ColumnInfo { name, type_oid });
-    }
-    Ok(columns)
+async fn get_table_columns(
+    client: &Client,
+    table: &str,
+) -> Result<Vec<ColumnInfo>, AppError> {
+    let query = "
+        SELECT a.attname, a.atttypid 
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        WHERE c.relname = $1 AND a.attnum > 0
+    ";
+    let rows = client.query(query, &[&table]).await?;
+    
+    rows.iter()
+        .map(|row| Ok(ColumnInfo {
+            name: row.try_get(0)?,
+            type_oid: row.try_get(1)?,
+        }))
+        .collect()
 }
 
-async fn worker(
-    config: JobConfig,
-    mut rx: mpsc::Receiver<(i64, i64)>,
-    total_rows: Arc<AtomicU64>,
-) -> Result<(), Box<dyn Error>> {
-    while let Some((start, end)) = rx.recv().await {
-        copy_batch(&config, start, end, &total_rows).await?;
+async fn write_copy_data(
+    mut sink: Pin<&mut CopyInSink<Bytes>>,
+    rows: &[Row],
+    columns: &[ColumnInfo],
+) -> Result<(), AppError> {
+    let mut buf = BytesMut::with_capacity(4096);
+    
+    for row in rows {
+        // Number of fields
+        buf.put_i16(columns.len() as i16);
+        
+        for (i, col) in columns.iter().enumerate() {
+            // Handle each field
+            match row.try_get::<_, Option<&[u8]>>(i) {
+                Ok(Some(bytes)) => {
+                    // Field length
+                    buf.put_i32(bytes.len() as i32);
+                    
+                    match Type::from_oid(col.type_oid) {
+                        Some(Type::JSONB) => {
+                            // JSONB has a version byte
+                            buf.put_u8(1);
+                            buf.put_slice(bytes);
+                        },
+                        Some(Type::INT4) if bytes.len() == 4 => {
+                            let num = i32::from_be_bytes(bytes[..4].try_into()?);
+                            buf.put_slice(&num.to_be_bytes());
+                        },
+                        Some(_) => {
+                            buf.put_slice(bytes);
+                        },
+                        None => return Err(AppError::InvalidDataType(col.type_oid)),
+                    }
+                },
+                _ => {
+                    // Null field
+                    buf.put_i32(-1);
+                }
+            }
+        }
     }
+    
+    sink.send(buf.freeze()).await?;
+    
     Ok(())
 }
 
@@ -159,7 +190,7 @@ async fn copy_batch(
     start: i64,
     end: i64,
     total_rows: &Arc<AtomicU64>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), AppError> {
     const MAX_RETRIES: usize = 3;
     let mut attempt = 0;
 
@@ -171,18 +202,20 @@ async fn copy_batch(
                 return Ok(());
             }
             Err(e) if attempt <= MAX_RETRIES => {
+                // Log the retry
+                log::warn!("Retrying batch {}-{}, attempt {}/{}: {:?}", start, end, attempt, MAX_RETRIES, e);
                 time::sleep(Duration::from_secs(2u64.pow(attempt as u32))).await;
                 continue;
             }
             Err(e) => {
                 if end - start == 0 {
-                    log::warn!("Skipping single row {}: {}", start, e);
+                    log::warn!("Skipping single row {}: {:?}", start, e);
                     return Ok(());
                 }
                 let batch_size = end - start + 1;
                 let new_size = (batch_size / 10).max(1);
-                log::warn!("Splitting batch {}-{} into size {}", start, end, new_size);
-                
+                log::warn!("Splitting batch {}-{} into size {}: {:?}", start, end, new_size, e);
+
                 let mut current = start;
                 while current <= end {
                     let sub_end = (current + new_size - 1).min(end);
@@ -195,22 +228,24 @@ async fn copy_batch(
     }
 }
 
-async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, Box<dyn Error>> {
-    let src_client = config.src_pool.get().await?;
-    let dest_client = config.dest_pool.get().await?;
+async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, AppError> {
+    let mut src_client = config.src_pool.get().await?;
+    let mut dest_client = config.dest_pool.get().await?;
 
     let copy_sql = format!(
         "COPY {} ({}) FROM STDIN BINARY",
         config.dest_table,
-        config.dest_columns.iter()
-            .map(|c| format!("\"{}\"", c.name.replace('"', "\"\""))
+        config
+            .dest_columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ")
     );
 
-    let mut src_txn = src_client.transaction().await?;
+    let src_txn = src_client.transaction().await?;
     let cursor_name = format!("cursor_{}_{}", start, end);
-    
+
     src_txn
         .execute(
             &format!(
@@ -221,105 +256,212 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, B
         )
         .await?;
 
-    let stream = src_txn.query_raw(&format!("FETCH ALL FROM {}", cursor_name), &[]).await?;
+    let rows = src_txn
+        .query(&format!("FETCH ALL FROM {}", cursor_name), &[])
+        .await?;
 
-    let mut dest_txn = dest_client.transaction().await?;
+    let dest_txn = dest_client.transaction().await?;
     let sink = dest_txn.copy_in(&copy_sql).await?;
-    let mut writer = BinaryCopyInWriter::new(sink, COPY_HEADER, COPY_TRAILER);
-
-    let mut count = 0;
-    let mut stream = RowStream::new(stream);
-    while let Some(row) = stream.try_next().await? {
-        let mut buf = BytesMut::new();
-        buf.put_u16(row.len() as u16);
-        
-        for (i, column) in config.dest_columns.iter().enumerate() {
-            let value = row.get::<_, Option<Bytes>>(i);
-            match (value, column.type_oid) {
-                (None, _) => buf.put_i32(-1),
-                (Some(bytes), Type::JSONB.oid()) => {
-                    let json_value: Value = serde_json::from_slice(&bytes)?;
-                    let mut jsonb_bytes = BytesMut::new();
-                    jsonb_bytes.put_u8(1);
-                    jsonb_bytes.extend_from_slice(&bytes);
-                    buf.put_i32(jsonb_bytes.len() as i32);
-                    buf.extend_from_slice(&jsonb_bytes);
-                }
-                (Some(bytes), Type::INT8.oid()) if bytes.len() == 4 => {
-                    let int_val = i32::from_be_bytes(bytes[..4].try_into()?);
-                    buf.put_i32(8);
-                    buf.put_i64(int_val as i64);
-                }
-                (Some(bytes), _) => {
-                    buf.put_i32(bytes.len() as i32);
-                    buf.extend_from_slice(&bytes);
-                }
-            }
-        }
-        writer.write(&buf.freeze()).await?;
-        count += 1;
-    }
-
-    writer.finish().await?;
-    dest_txn.commit().await?;
-    src_txn.commit().await?;
-    Ok(count)
-}
-
-async fn report_progress(total_rows: Arc<AtomicU64>) {
-    let start_time = Instant::now();
-    let mut interval = time::interval(Duration::from_secs(5));
     
-    loop {
-        interval.tick().await;
-        let rows = total_rows.load(Ordering::Relaxed);
-        let duration = start_time.elapsed().as_secs_f64();
-        let rate = rows as f64 / duration;
-        log::info!("Progress: {} rows ({:.2} rows/sec)", rows, rate);
+    // Pin the sink
+    futures::pin_mut!(sink);
+
+    // Process in small chunks to avoid memory issues
+    let chunk_size = 100;
+    
+    for chunk in rows.chunks(chunk_size) {
+        write_copy_data(sink.as_mut(), chunk, &config.dest_columns).await?;
     }
+
+    // Finalize
+    sink.send(Bytes::from_static(COPY_TRAILER)).await?;
+    
+    dest_txn.commit().await.map_err(AppError::Database)?;
+    src_txn.commit().await.map_err(AppError::Database)?;
+    Ok(rows.len() as u64)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-    
-    let args: Vec<String> = env::args().collect();
-    // Argument parsing omitted for brevity - use clap or similar in real code
-    
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let args = Cli::parse();
+    let dest_table = args.dest.as_deref().unwrap_or(&args.source);
+    let dest_conn = args.dest_conn.as_deref().unwrap_or(&args.source_conn);
+
+    // Create connection pools
+    let src_pool = create_pool(&args.source_conn, args.concurrency).await?;
+    let dest_pool = create_pool(dest_conn, args.concurrency).await?;
+
+    // Get destination columns
+    let dest_client = dest_pool.get().await?;
+    let dest_columns = get_table_columns(&dest_client, dest_table).await?;
+
     let config = JobConfig {
-        src_pool: create_pool("source_conn_str", 10).await?,
-        dest_pool: create_pool("dest_conn_str", 10).await?,
-        source_table: "source_table".to_string(),
-        dest_table: "dest_table".to_string(),
-        dest_columns: vec![/* populated from DB */],
+        src_pool: src_pool.clone(),
+        dest_pool: dest_pool.clone(),
+        source_table: args.source.clone(),
+        dest_table: dest_table.to_string(),
+        dest_columns,
     };
 
     let total_rows = Arc::new(AtomicU64::new(0));
-    let (tx, rx) = mpsc::channel(100);
     
-    // Generate batches (example)
-    for batch in generate_batches(0, 1000000, 1000) {
-        tx.send(batch).await?;
-    }
+    // Create a batch producer channel
+    let (tx, mut rx) = mpsc::channel(100);
+    
+    // Create a channel for workers to notify completion
+    let (done_tx, mut done_rx) = mpsc::channel(1);
 
-    let mut handles = vec![];
-    for _ in 0..10 {
+    // Setup graceful shutdown
+    let (shutdown_signal, shutdown_listener) = watch::channel(false);
+
+    // Generate batches in background
+    tokio::spawn({
+        let tx = tx.clone();
+        async move {
+            for batch in generate_batches(args.start, args.end, args.batch) {
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+            drop(tx); // Close producer side when all batches are sent
+        }
+    });
+
+    // Worker tasks - we need to create one worker for each concurrency value
+    // Unlike Go, Tokio's mpsc Receiver is not cloneable, so we need a different approach
+    let mut handles = Vec::new();
+    for i in 0..args.concurrency {
         let cfg = config.clone();
-        let rx = rx.clone();
         let total = total_rows.clone();
-        handles.push(tokio::spawn(async move {
-            worker(cfg, rx, total).await
-        }));
+        let mut shutdown = shutdown_listener.clone();
+        let worker_done_tx = done_tx.clone();
+        
+        // Use a separate channel for each worker
+        let (worker_tx, mut worker_rx) = mpsc::channel(10);
+        
+        // Add this worker's sender to our worker list
+        let worker_sender = worker_tx.clone();
+        
+        // Start the worker task
+        let handle = tokio::spawn(async move {
+            let mut worker_done = false;
+            
+            loop {
+                if worker_done {
+                    break;
+                }
+                
+                tokio::select! {
+                    biased;
+                    
+                    // Handle shutdown signal
+                    _ = shutdown.changed() => {
+                        log::info!("Worker {} shutting down", i);
+                        break;
+                    },
+                    
+                    // Process a batch
+                    result = worker_rx.recv() => {
+                        match result {
+                            Some((start, end)) => {
+                                if let Err(e) = copy_batch(&cfg, start, end, &total).await {
+                                    log::error!("Worker {}: Batch {}-{} failed: {:?}", i, start, end, e);
+                                }
+                            },
+                            None => {
+                                // Channel closed, no more batches
+                                worker_done = true;
+                                let _ = worker_done_tx.send(()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        handles.push((handle, worker_sender));
     }
-
-    let progress = tokio::spawn(report_progress(total_rows.clone()));
     
-    for handle in handles {
-        handle.await??;
-    }
-    progress.abort();
+    // Drop original sender as we've given a copy to each worker
+    drop(done_tx);
+    
+    // Spawn a task to distribute work to all workers
+    tokio::spawn({
+        let worker_senders = handles.iter().map(|(_, tx)| tx.clone()).collect::<Vec<_>>();
+        async move {
+            let mut current_worker = 0;
+            let worker_count = worker_senders.len();
+            
+            // Read batches from the main channel and distribute to workers
+            while let Some(batch) = rx.recv().await {
+                // Round-robin assignment to workers
+                if let Err(e) = worker_senders[current_worker].send(batch).await {
+                    log::error!("Failed to send batch to worker {}: {:?}", current_worker, e);
+                }
+                current_worker = (current_worker + 1) % worker_count;
+            }
+            
+            // Close all worker channels when the main channel is closed
+            for (i, tx) in worker_senders.iter().enumerate() {
+                let _ = tx;
+                log::debug!("Closed channel for worker {}", i);
+            }
+        }
+    });
 
-    log::info!("Completed copying {} rows", total_rows.load(Ordering::Relaxed));
+    // Progress reporting
+    let progress_handle = tokio::spawn({
+        let total_rows = total_rows.clone();
+        let mut shutdown = shutdown_listener.clone();
+        async move {
+            let start_time = Instant::now();
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let rows = total_rows.load(Ordering::Relaxed);
+                        let duration = start_time.elapsed().as_secs_f64();
+                        if duration > 0.0 {
+                            log::info!("Progress: {} rows ({:.2}/sec)", rows, rows as f64 / duration);
+                        } else {
+                            log::info!("Progress: {} rows", rows);
+                        }
+                    }
+                    _ = shutdown.changed() => break,
+                }
+            }
+        }
+    });
+
+    // Wait for shutdown signal or all workers to finish
+    tokio::select! {
+        _ = signal_handler() => {
+            log::info!("Shutdown signal received, waiting for workers to complete...");
+            let _ = shutdown_signal.send(true);
+        }
+        _ = async {
+            // Wait for at least one worker to signal they're done (should be the last one)
+            let _ = done_rx.recv().await;
+            log::info!("All batches processed!");
+        } => {}
+    }
+
+    // Cleanup - abort the progress reporter
+    progress_handle.abort();
+
+    // Wait for all workers to finish (with timeout)
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(10), 
+                                         futures::future::join_all(handles.into_iter().map(|(h, _)| h))).await {
+        log::warn!("Timed out waiting for some workers to finish");
+    }
+
+    log::info!(
+        "Completed copying {} rows",
+        total_rows.load(Ordering::Relaxed)
+    );
     Ok(())
 }
 
@@ -338,13 +480,13 @@ async fn signal_handler() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
-            .expect("failed to install Ctrl+C handler");
+            .expect("Failed to install Ctrl+C handler")
     };
 
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
+            .expect("Failed to install signal handler")
             .recv()
             .await;
     };
