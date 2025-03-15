@@ -2,13 +2,13 @@
 set -e
 
 echo "Starting PostgreSQL containers..."
-docker-compose up -d
+# docker compose up -d
 
 echo "Waiting for containers to be ready..."
 sleep 5  # Give some time for containers to initialize
 
 # Connection strings for the application
-SOURCE_CONN="postgresql://postgres:postgres@localhost:5432/source_db"
+SOURCE_CONN="postgresql://postgres:postgres@localhost:5434/source_db"
 DEST_CONN="postgresql://postgres:postgres@localhost:5433/dest_db"
 
 echo "=============================================="
@@ -33,4 +33,4 @@ echo "cargo run -- -s inventory -d inventory --start 1 --end 500 -b 50 -c 4 \\"
 echo "    --source-conn \"$SOURCE_CONN\" --dest-conn \"$DEST_CONN\""
 echo ""
 echo "To stop the containers when done:"
-echo "docker-compose down"
+# echo "docker compose down"

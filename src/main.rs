@@ -246,13 +246,17 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     let src_txn = src_client.transaction().await?;
     let cursor_name = format!("cursor_{}_{}", start, end);
 
+    // Convert i64 to i32 to match PostgreSQL's INT4 type
+    let start_i32: i32 = start.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", start)))?;
+    let end_i32: i32 = end.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", end)))?;
+    
     src_txn
         .execute(
             &format!(
                 "DECLARE {} NO SCROLL CURSOR FOR SELECT * FROM {} WHERE id BETWEEN $1 AND $2",
                 cursor_name, config.source_table
             ),
-            &[&start, &end],
+            &[&start_i32, &end_i32],
         )
         .await?;
 
