@@ -10,24 +10,29 @@ use std::{
 };
 
 use async_recursion::async_recursion;
-use bytes::{BufMut, BytesMut, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use deadpool_postgres::{Config, CreatePoolError, Pool, PoolError, Runtime};
 use futures::SinkExt;
 use log;
 use postgres_types::Type;
+use std::pin::Pin;
 use tokio::{
     signal,
     sync::{mpsc, watch},
     time,
 };
 use tokio_postgres::{Client, CopyInSink, Error as TokioPostgresError, NoTls, Row};
-use std::pin::Pin;
 
 use clap::Parser;
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Copier for PostgreSQL",
+    long_about = "A fast batch copy tool for PostgreSQL"
+)]
 struct Cli {
     /// Source table name
     #[arg(short, long)]
@@ -121,10 +126,7 @@ async fn create_pool(conn_str: &str, max_size: usize) -> Result<Pool, AppError> 
     Ok(pool)
 }
 
-async fn get_table_columns(
-    client: &Client,
-    table: &str,
-) -> Result<Vec<ColumnInfo>, AppError> {
+async fn get_table_columns(client: &Client, table: &str) -> Result<Vec<ColumnInfo>, AppError> {
     let query = "
         SELECT a.attname, a.atttypid 
         FROM pg_attribute a
@@ -132,12 +134,14 @@ async fn get_table_columns(
         WHERE c.relname = $1 AND a.attnum > 0
     ";
     let rows = client.query(query, &[&table]).await?;
-    
+
     rows.iter()
-        .map(|row| Ok(ColumnInfo {
-            name: row.try_get(0)?,
-            type_oid: row.try_get(1)?,
-        }))
+        .map(|row| {
+            Ok(ColumnInfo {
+                name: row.try_get(0)?,
+                type_oid: row.try_get(1)?,
+            })
+        })
         .collect()
 }
 
@@ -147,18 +151,19 @@ async fn write_copy_data(
     columns: &[ColumnInfo],
 ) -> Result<(), AppError> {
     let mut buf = BytesMut::with_capacity(4096);
-    
+
     for row in rows {
         // Number of fields
         buf.put_i16(columns.len() as i16);
-        
+
         for (i, col) in columns.iter().enumerate() {
             // Try to get the column by name first for more reliable access
             let col_name = &col.name;
-            let col_type = Type::from_oid(col.type_oid).ok_or_else(|| AppError::InvalidDataType(col.type_oid))?;
-            
+            let col_type = Type::from_oid(col.type_oid)
+                .ok_or_else(|| AppError::InvalidDataType(col.type_oid))?;
+
             // Handle each field type appropriately - check for NULL values by trying to get them first
-            
+
             match col_type {
                 Type::INT4 => {
                     if let Ok(value) = row.try_get::<_, i32>(i) {
@@ -168,7 +173,7 @@ async fn write_copy_data(
                         // If we can't get the value as expected type, use NULL
                         buf.put_i32(-1);
                     }
-                },
+                }
                 Type::TEXT | Type::VARCHAR => {
                     if let Ok(value) = row.try_get::<_, String>(i) {
                         let bytes = value.as_bytes();
@@ -177,7 +182,7 @@ async fn write_copy_data(
                     } else {
                         buf.put_i32(-1);
                     }
-                },
+                }
                 Type::BOOL => {
                     if let Ok(value) = row.try_get::<_, bool>(i) {
                         buf.put_i32(1); // Length
@@ -185,7 +190,7 @@ async fn write_copy_data(
                     } else {
                         buf.put_i32(-1);
                     }
-                },
+                }
                 Type::TIMESTAMP | Type::TIMESTAMPTZ => {
                     // Get as string and encode as bytes
                     if let Ok(value) = row.try_get::<_, String>(i) {
@@ -195,7 +200,7 @@ async fn write_copy_data(
                     } else {
                         buf.put_i32(-1);
                     }
-                },
+                }
                 Type::JSONB => {
                     if let Ok(value) = row.try_get::<_, serde_json::Value>(i) {
                         let json_string = serde_json::to_string(&value).unwrap_or_default();
@@ -206,7 +211,7 @@ async fn write_copy_data(
                     } else {
                         buf.put_i32(-1);
                     }
-                },
+                }
                 // Add other types as needed
                 _ => {
                     // For unknown types, try to get as string
@@ -221,10 +226,20 @@ async fn write_copy_data(
                 }
             }
         }
+
+        // Send every row individually to avoid buffering too much data
+        // This helps prevent potential memory issues and ensures data is sent promptly
+        if buf.len() > 0 {
+            sink.send(buf.freeze()).await?;
+            buf = BytesMut::with_capacity(4096);
+        }
     }
-    
-    sink.send(buf.freeze()).await?;
-    
+
+    // Send any remaining data
+    if buf.len() > 0 {
+        sink.send(buf.freeze()).await?;
+    }
+
     Ok(())
 }
 
@@ -247,7 +262,14 @@ async fn copy_batch(
             }
             Err(e) if attempt <= MAX_RETRIES => {
                 // Log the retry
-                log::warn!("Retrying batch {}-{}, attempt {}/{}: {:?}", start, end, attempt, MAX_RETRIES, e);
+                log::warn!(
+                    "Retrying batch {}-{}, attempt {}/{}: {:?}",
+                    start,
+                    end,
+                    attempt,
+                    MAX_RETRIES,
+                    e
+                );
                 time::sleep(Duration::from_secs(2u64.pow(attempt as u32))).await;
                 continue;
             }
@@ -258,7 +280,13 @@ async fn copy_batch(
                 }
                 let batch_size = end - start + 1;
                 let new_size = (batch_size / 10).max(1);
-                log::warn!("Splitting batch {}-{} into size {}: {:?}", start, end, new_size, e);
+                log::warn!(
+                    "Splitting batch {}-{} into size {}: {:?}",
+                    start,
+                    end,
+                    new_size,
+                    e
+                );
 
                 let mut current = start;
                 while current <= end {
@@ -275,15 +303,14 @@ async fn copy_batch(
 async fn send_copy_header(mut sink: Pin<&mut CopyInSink<Bytes>>) -> Result<(), AppError> {
     // Create a buffer for the header
     let mut header = BytesMut::with_capacity(19); // Size of signature (11) + flags (4) + extension area size (4)
-    
+
     // Add signature, flags, and header extension size
     header.put_slice(PGCOPY_SIGNATURE);
     header.put_slice(PGCOPY_FLAGS);
     header.put_slice(PGCOPY_HEADER_EXT_SIZE);
-    
+
     // Send the header
-    sink.send(header.freeze()).await?
-;    
+    sink.send(header.freeze()).await?;
     Ok(())
 }
 
@@ -308,33 +335,38 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     let cursor_name = format!("cursor_{}_{}", start, end);
 
     // Convert i64 to i32 to match PostgreSQL's INT4 type
-    let start_i32: i32 = start.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", start)))?;
-    let end_i32: i32 = end.try_into().map_err(|_| AppError::Other(format!("ID {} too large for i32", end)))?;
-    
+    let start_i32: i32 = start
+        .try_into()
+        .map_err(|_| AppError::Other(format!("ID {} too large for i32", start)))?;
+    let end_i32: i32 = end
+        .try_into()
+        .map_err(|_| AppError::Other(format!("ID {} too large for i32", end)))?;
+
     let query = format!(
         "DECLARE {} NO SCROLL CURSOR FOR SELECT * FROM {} WHERE id BETWEEN $1 AND $2",
         cursor_name, config.source_table
     );
-    log::debug!("Executing query: {} with params [{}, {}]", query, start_i32, end_i32);
-    
-    src_txn
-        .execute(&query, &[&start_i32, &end_i32])
-        .await?;
-        
+    log::debug!(
+        "Executing query: {} with params [{}, {}]",
+        query,
+        start_i32,
+        end_i32
+    );
+
+    src_txn.execute(&query, &[&start_i32, &end_i32]).await?;
+
     log::debug!("Cursor declared, fetching rows");
 
     let fetch_query = format!("FETCH ALL FROM {}", cursor_name);
     log::debug!("Executing fetch query: {}", fetch_query);
-    let rows = src_txn
-        .query(&fetch_query, &[])
-        .await?;
+    let rows = src_txn.query(&fetch_query, &[]).await?;
 
     log::debug!("Fetched {} rows from source", rows.len());
     if rows.is_empty() {
         log::warn!("No rows found for batch {}-{}", start, end);
         return Ok(0);
     }
-    
+
     // Debug: print the first row to verify structure
     if !rows.is_empty() {
         let first_row = &rows[0];
@@ -348,28 +380,31 @@ async fn attempt_copy(config: &JobConfig, start: i64, end: i64) -> Result<u64, A
     let dest_txn = dest_client.transaction().await?;
     log::debug!("Initiating COPY operation: {}", copy_sql);
     let sink = dest_txn.copy_in(&copy_sql).await?;
-    
+
     // Pin the sink
     futures::pin_mut!(sink);
-    
+
     log::debug!("Sending COPY header");
     send_copy_header(sink.as_mut()).await?;
 
     // Process in small chunks to avoid memory issues
     let chunk_size = 100;
     log::debug!("Processing {} rows in chunks of {}", rows.len(), chunk_size);
-    
+
     for chunk in rows.chunks(chunk_size) {
         write_copy_data(sink.as_mut(), chunk, &config.dest_columns).await?;
     }
 
     // Finalize
     sink.send(Bytes::from_static(COPY_TRAILER)).await?;
-    
+
+    // Ensure the COPY operation is properly finished
+    sink.finish().await.map_err(AppError::Database)?;
+
     log::debug!("Committing transactions");
     dest_txn.commit().await.map_err(AppError::Database)?;
     src_txn.commit().await.map_err(AppError::Database)?;
-    
+
     log::debug!("Successfully copied {} rows", rows.len());
     Ok(rows.len() as u64)
 }
@@ -399,10 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let total_rows = Arc::new(AtomicU64::new(0));
-    
+
     // Create a batch producer channel
     let (tx, mut rx) = mpsc::channel(100);
-    
+
     // Create a channel for workers to notify completion
     let (done_tx, mut done_rx) = mpsc::channel(1);
 
@@ -430,31 +465,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total = total_rows.clone();
         let mut shutdown = shutdown_listener.clone();
         let worker_done_tx = done_tx.clone();
-        
+
         // Use a separate channel for each worker
         let (worker_tx, mut worker_rx) = mpsc::channel(10);
-        
+
         // Add this worker's sender to our worker list
         let worker_sender = worker_tx.clone();
-        
+
         // Start the worker task
         let handle = tokio::spawn(async move {
             let mut worker_done = false;
-            
+
             loop {
                 if worker_done {
                     break;
                 }
-                
+
                 tokio::select! {
                     biased;
-                    
+
                     // Handle shutdown signal
                     _ = shutdown.changed() => {
                         log::info!("Worker {} shutting down", i);
                         break;
                     },
-                    
+
                     // Process a batch
                     result = worker_rx.recv() => {
                         match result {
@@ -473,20 +508,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
-        
+
         handles.push((handle, worker_sender));
     }
-    
+
     // Drop original sender as we've given a copy to each worker
     drop(done_tx);
-    
+
     // Spawn a task to distribute work to all workers
     tokio::spawn({
         let worker_senders = handles.iter().map(|(_, tx)| tx.clone()).collect::<Vec<_>>();
         async move {
             let mut current_worker = 0;
             let worker_count = worker_senders.len();
-            
+
             // Read batches from the main channel and distribute to workers
             while let Some(batch) = rx.recv().await {
                 // Round-robin assignment to workers
@@ -495,10 +530,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 current_worker = (current_worker + 1) % worker_count;
             }
-            
+
+            log::debug!("All batches have been distributed, closing worker channels...");
+
             // Close all worker channels when the main channel is closed
             for (i, tx) in worker_senders.iter().enumerate() {
-                let _ = tx;
+                drop(tx.clone()); // Explicitly drop the sender to close the channel
                 log::debug!("Closed channel for worker {}", i);
             }
         }
@@ -536,9 +573,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = shutdown_signal.send(true);
         }
         _ = async {
-            // Wait for at least one worker to signal they're done (should be the last one)
+            // Wait for at least one worker to signal they're done
             let _ = done_rx.recv().await;
             log::info!("All batches processed!");
+
+            // Signal shutdown to finish cleanly
+            let _ = shutdown_signal.send(true);
         } => {}
     }
 
@@ -546,8 +586,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     progress_handle.abort();
 
     // Wait for all workers to finish (with timeout)
-    if let Err(_) = tokio::time::timeout(Duration::from_secs(10), 
-                                         futures::future::join_all(handles.into_iter().map(|(h, _)| h))).await {
+    if let Err(_) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join_all(handles.into_iter().map(|(h, _)| h)),
+    )
+    .await
+    {
         log::warn!("Timed out waiting for some workers to finish");
     }
 
